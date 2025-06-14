@@ -1,0 +1,14 @@
+# PlatformIO
+.pio/
+.vscode/
+
+# Build artifacts & firmware
+build/
+firmware/
+*.bin
+*.elf
+
+# Other common files
+*.bak
+*.tmp
+*~
