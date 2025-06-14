@@ -19,8 +19,17 @@
 
 void displayHadith();
 bool fetchHadith(String &hadithText, String &hadithSource, String &englishNarrator, int &hadithNumber);
-void drawQRCode(String url, int x, int y, int size, UBYTE* image);
+#include <ArduinoJson.h> // For parsing JSON from API
+
+// Constants for Hadith text length
+const int MIN_HADITH_LENGTH = 50; 
+const int MAX_HADITH_LENGTH = 300; // User's previous limit
+
 int drawWrappedText(const char* text, int x, int y, sFONT* font, UWORD background, UWORD foreground);
+
+// Constants for deep sleep
+#define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds
+#define TIME_TO_SLEEP  3600         // Time ESP32 will go to sleep (in seconds) - 1 hour (3600s)
 
 // WiFi credentials
 const char* ssid = "ATYMK1";
@@ -44,37 +53,98 @@ const char* hadith_api_base = "https://hadithapi.com/api/hadiths?apiKey=$2y$10$F
 UBYTE *BlackImage = NULL;
 UBYTE *RedImage = NULL;
 
+// Helper function to shuffle an array (Fisher-Yates)
+static void shuffleArray(int arr[], int n) {
+    if (n <= 0) return;
+    for (int i = n - 1; i > 0; i--) {
+        int j = random(0, i + 1); // random() is exclusive for the upper bound in Arduino, so i+1 is correct for 0 to i inclusive
+        int temp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = temp;
+    }
+}
+
 void setup() {
     Serial.begin(115200);
-  // Initialize display hardware
-  DEV_Module_Init();
+    // delay(1000); // Optional: For serial monitor to connect during debugging
+    Serial.println("\nWoke up / Booting...");
+
+    // Initialize display hardware
+    DEV_Module_Init();
     EPD_7IN5B_V2_Init();
-    EPD_7IN5B_V2_Clear();
+    EPD_7IN5B_V2_Clear(); // Clear the physical display screen
 
     // Create frame buffers
     UWORD Imagesize = ((EPD_7IN5B_V2_WIDTH % 8 == 0) ? (EPD_7IN5B_V2_WIDTH / 8 ) : (EPD_7IN5B_V2_WIDTH / 8 + 1)) * EPD_7IN5B_V2_HEIGHT;
-    BlackImage = (UBYTE *)malloc(Imagesize);
-    RedImage = (UBYTE *)malloc(Imagesize);
+    // Ensure buffers are allocated only if they haven't been (e.g. if RTC mem was used, though not here)
+    // For standard deep sleep with reset, malloc will run each time.
+    if (BlackImage == NULL) BlackImage = (UBYTE *)malloc(Imagesize);
+    if (RedImage == NULL) RedImage = (UBYTE *)malloc(Imagesize);
+
+    if (BlackImage == NULL || RedImage == NULL) {
+        Serial.println("Failed to allocate memory for frame buffers!");
+        // Potentially try to display an error if enough of the system is up
+        // For now, just go back to sleep.
+        Serial.println("Going to sleep due to memory allocation error...");
+        esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+        esp_deep_sleep_start();
+        return; // Should not be reached
+    }
+    
     Paint_NewImage(BlackImage, EPD_7IN5B_V2_WIDTH, EPD_7IN5B_V2_HEIGHT, 270, WHITE);
     Paint_NewImage(RedImage, EPD_7IN5B_V2_WIDTH, EPD_7IN5B_V2_HEIGHT, 270, WHITE);
 
+    // Connect to Wi-Fi
     WiFi.begin(ssid, password);
     Serial.print("Connecting to WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
+    int wifi_retries = 0;
+    const int max_wifi_retries = 20; // Try for 10 seconds (20 * 500ms)
+    while (WiFi.status() != WL_CONNECTED && wifi_retries < max_wifi_retries) {
         delay(500);
         Serial.print(".");
+        wifi_retries++;
     }
-    Serial.println("\nWiFi connected");
-    displayHadith();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected");
+        displayHadith(); // This function fetches and displays the Hadith
+    } else {
+        Serial.println("\nFailed to connect to WiFi.");
+        // Optionally display a "No Wi-Fi" message on the e-paper
+        Paint_SelectImage(BlackImage); // Ensure black image is selected for text
+        Paint_Clear(WHITE);            // Clear buffer before drawing error
+        Paint_DrawString_EN(10, EPD_7IN5B_V2_WIDTH/2 - 20, (char*)"Failed to connect to WiFi.", &Font32, WHITE, BLACK);
+        EPD_7IN5B_V2_Display(BlackImage, RedImage); // Display the error message
+        DEV_Delay_ms(2000); // Show error for a bit if display was updated
+    }
+
+    // Disconnect Wi-Fi and turn off radio to save power
+    Serial.println("Disconnecting WiFi...");
+    WiFi.disconnect(true); // true = also erase WiFi credentials from RAM
+    WiFi.mode(WIFI_OFF);
+    Serial.println("WiFi disconnected and radio off.");
+
+    // Put the e-paper display to sleep
+    Serial.println("Putting e-paper display to sleep.");
+    EPD_7IN5B_V2_Sleep();
+    
+    // Release resources used by display module (EPD_7IN5B_V2_Sleep() handles display power down)
+    Serial.println("Display module put to sleep.");
+
+    // Configure deep sleep
+    Serial.println("Configuring deep sleep for " + String(TIME_TO_SLEEP) + " seconds.");
+    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+    Serial.println("Going to sleep now...");
+    Serial.flush(); // Ensure all serial messages are sent
+    esp_deep_sleep_start();
+
+    // Code below esp_deep_sleep_start() will not be executed on a normal wake-up cycle
 }
 
 void loop() {
-    // Fetch and display hadith every 2 minutes
-    displayHadith();
-    const long interval = 60 * 60 * 1000; // 2 minutes in milliseconds
-    for (int i = 0; i < interval / 1000; i++) {
-        delay(1000); 
-    }
+  // This function will not be executed when deep sleep is enabled,
+  // as the ESP32 resets and runs setup() on each wake-up.
+  // Kept empty for this reason.
 }
 
 void displayHadith() {
@@ -120,16 +190,17 @@ void displayHadith() {
         Serial.println("[DEBUG] Source Y position: " + String(source_y));
         
         // Draw the narrator above the source if available
+        
         Paint_SelectImage(RedImage);
         if (englishNarrator.length() > 0) {
             // Draw narrator 40px above the source
-            int narrator_y = source_y - 40;
-            Paint_DrawString_EN(10, narrator_y, (char*)englishNarrator.c_str(), &Font24, WHITE, RED);
+            int narrator_y = hadith_start_y - 20;
+            Paint_DrawString_EN(10, narrator_y, (char*)englishNarrator.c_str(), &Font16, WHITE, RED);
             Serial.println("[DEBUG] Drawing narrator at Y position: " + String(narrator_y));
         }
         
-        // Draw the source at the bottom of the screen with Font32 in red
-        Paint_DrawString_EN(10, source_y, (char*)hadithSource.c_str(), &Font32, WHITE, RED);
+        // Draw the source at the bottom of the screen with Font16 in red
+        Paint_DrawString_EN(10, source_y, (char*)hadithSource.c_str(), &Font16, WHITE, RED);
         
         // Generate and draw QR code with Arabic text
         // Extract just the Arabic text by finding it in the hadith string
@@ -163,7 +234,7 @@ void displayHadith() {
         // EPD_7IN5B_V2_HEIGHT = 480 (width in portrait mode)
         // EPD_7IN5B_V2_WIDTH = 800 (height in portrait mode)
         int text_x = EPD_7IN5B_V2_HEIGHT - text_margin - 110;  // From right edge
-        int text_y = EPD_7IN5B_V2_WIDTH - text_margin - 10;    // From bottom edge
+        int text_y = EPD_7IN5B_V2_WIDTH - text_margin - 5;    // From bottom edge
         
         // Draw the hadith number text in black
         Paint_SelectImage(BlackImage);
@@ -184,245 +255,127 @@ void displayHadith() {
 
 
 bool fetchHadith(String &hadithText, String &hadithSource, String &englishNarrator, int &hadithNumber) {
-    // Try up to 5 times to get a valid hadith that fits within our length limit
-    for (int attempt = 1; attempt <= 5; attempt++) {
-        // Generate a random hadith number between 1 and 1000
-        hadithNumber = random(1, 1001);
+    for (int attempt = 1; attempt <= 10; attempt++) {
+        // Generate a random hadith number. The API seems to use 1-based indexing.
+        // Max hadith number observed in example was 7563, but it's safer to use a known range or test API limits.
+        // For now, using the user's last range.
+        hadithNumber = random(1, 7563); 
         String apiUrl = String(hadith_api_base) + String(hadithNumber);
         
-        Serial.println("\n[DEBUG] Fetching hadith from API (attempt " + String(attempt) + ")");
-        Serial.print("[DEBUG] API URL: ");
-        Serial.println(apiUrl);
-        
+        Serial.println("\n[DEBUG] Fetching hadith from API (attempt " + String(attempt) + " for hadithNumber: " + String(hadithNumber) + ")");
+        Serial.println("[DEBUG] API URL: " + apiUrl);
+
         HTTPClient http;
         http.begin(apiUrl);
-        Serial.println("[DEBUG] Sending GET request...");
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Allow redirects
         int httpCode = http.GET();
-        Serial.print("[DEBUG] HTTP Response code: ");
-        Serial.println(httpCode);
-        
-        if (httpCode == HTTP_CODE_OK) {
-            String payload = http.getString();
-            Serial.println("[DEBUG] Response size: " + String(payload.length()) + " bytes");
-            
-            // Simple string-based extraction instead of full JSON parsing
-            int hadithStartPos = payload.indexOf("\"hadithEnglish\":");
-            if (hadithStartPos > 0) {
-                Serial.println("[DEBUG] Found hadithEnglish field at position " + String(hadithStartPos));
-                
-                // Find the start of the actual text - need to find the first quote after the colon
-                hadithStartPos += 15; // Skip "hadithEnglish":
-                int quotePos = payload.indexOf("\"", hadithStartPos);
-                if (quotePos > hadithStartPos) {
-                    hadithStartPos = quotePos + 1; // Position after the opening quote
-                    
-                    // Find the closing quote - need to be careful to find the right one
-                    int hadithEndPos = -1;
-                    int searchPos = hadithStartPos;
-                    
-                    // Search for the closing quote, skipping any escaped quotes
-                    while (searchPos < payload.length()) {
-                        int nextQuote = payload.indexOf("\"", searchPos);
-                        if (nextQuote == -1) break;  // No more quotes found
+
+        if (httpCode > 0) {
+            Serial.printf("[DEBUG] HTTP GET... code: %d\n", httpCode);
+            if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+                String payload = http.getString();
+                StaticJsonDocument<8192> doc; // Using StaticJsonDocument, likely ArduinoJson v6
+                DeserializationError error = deserializeJson(doc, payload);
+
+                if (error) {
+                    Serial.print(F("[ERROR] deserializeJson() failed: "));
+                    Serial.println(error.f_str());
+                    http.end();
+                    delay(500); // Wait before next attempt
+                    continue; // Try next API call attempt
+                }
+
+                if (!doc["hadiths"].is<JsonObject>() || !doc["hadiths"]["data"].is<JsonArray>()) {
+                    Serial.println(F("[ERROR] JSON structure missing 'hadiths' or 'data' array, or 'hadiths' is not an object."));
+                    http.end();
+                    delay(500); // Wait before next attempt
+                    continue;
+                }
+
+                JsonArray hadithsInPayload = doc["hadiths"]["data"].as<JsonArray>();
+                int numInPayload = hadithsInPayload.size();
+                Serial.println("[DEBUG] Found " + String(numInPayload) + " hadith entries in this payload.");
+
+                if (numInPayload > 0) {
+                    int indices[numInPayload];
+                    for (int i = 0; i < numInPayload; i++) indices[i] = i;
+                    shuffleArray(indices, numInPayload); // Shuffle to try them in random order
+
+                    for (int i = 0; i < numInPayload; i++) {
+                        JsonObject hadithObject = hadithsInPayload[indices[i]];
                         
-                        // Check if this quote is escaped (preceded by a backslash)
-                        if (nextQuote > 0 && payload.charAt(nextQuote - 1) == '\\') {
-                            // This is an escaped quote, skip it
-                            searchPos = nextQuote + 1;
-                        } else {
-                            // This is the unescaped closing quote we're looking for
-                            hadithEndPos = nextQuote;
-                            break;
+                        if (hadithObject["hadithEnglish"].isNull()) {
+                            Serial.println("[DEBUG] Skipping entry " + String(indices[i]) + ", hadithEnglish is null or missing.");
+                            continue;
                         }
-                    }
-                    
-                    if (hadithEndPos > hadithStartPos) {
-                        // Extract the full hadith text including the first character
-                        hadithText = payload.substring(hadithStartPos, hadithEndPos);
-                        int originalLength = hadithText.length();
-                        Serial.println("[DEBUG] Original hadith length: " + String(originalLength) + " characters");
+                        hadithText = String(hadithObject["hadithEnglish"].as<const char*>());
                         
-                        // Process the hadith text
-                        // 1. Remove all backslashes and quotes
-                        hadithText.replace("\\", "");
-                        hadithText.replace("\"", " ");
-                        
-                        // 2. Handle Unicode escape sequences
-                        hadithText.replace("ufdfa", "(PBUH)");
-                        
-                        // 3. Only replace escaped newlines, not all n's and r's
-                        // We need to stop replacing all n's and r's as it removes these letters from words
-                        // The backslashes were already removed in step 1, so we don't need to handle escaped chars
-                        
-                        // Print debug info
-                        int processedLength = hadithText.length();
-                        Serial.println("[DEBUG] Processed hadith length: " + String(processedLength) + " characters");
-                        
-                        // Check if the hadith is a good length for display (not too short, not too long)
-                        if (processedLength < 50) {
-                            Serial.println("[DEBUG] Hadith too short (" + String(processedLength) + " chars), trying another...");
-                            http.end();
-                            continue; // Try another hadith
-                        }
-                        
-                        // Skip hadiths that are too long - don't even try to truncate them
-                        // This ensures we only show hadiths that naturally fit on the screen
-                        if (processedLength > 300) {
-                            Serial.println("[DEBUG] Hadith too long (" + String(processedLength) + " chars), trying another...");
-                            http.end();
-                            continue; // Try another hadith
-                        }
-                        
-                        // Print a preview of the processed hadith
-                        int previewLength = min(100, processedLength);
-                        Serial.println("[DEBUG] Processed hadith preview: '" + hadithText.substring(0, previewLength) + "'");
-                        
-                        // Extract the source information
-                        int bookStartPos = payload.indexOf("\"bookName\":");
-                        if (bookStartPos > 0) {
-                            bookStartPos += 12; // Skip "bookName":"
-                            int bookEndPos = payload.indexOf("\"", bookStartPos);
-                            String book = payload.substring(bookStartPos, bookEndPos);
-                            
-                            int chapterStartPos = payload.indexOf("\"chapterEnglish\":");
-                            if (chapterStartPos > 0) {
-                                chapterStartPos += 17; // Skip "chapterEnglish":"
-                                int chapterEndPos = payload.indexOf("\"", chapterStartPos);
-                                String chapter = payload.substring(chapterStartPos, chapterEndPos);
-                                
-                                hadithSource = book + " - " + chapter;
-                                Serial.println("[DEBUG] Extracted source: " + hadithSource);
-                                
-                                // Extract the narrator information
-                                Serial.println("[DEBUG] Looking for englishNarrator field in API response");
-                                
-                                // Print a small portion of the payload for debugging
-                                int previewLength = min(200, (int)payload.length());
-                                Serial.println("[DEBUG] API response preview: " + payload.substring(0, previewLength) + "...");
-                                
-                                // Try different field names that might be in the API
-                                int narratorStartPos = payload.indexOf("\"englishNarrator\":");
-                                if (narratorStartPos <= 0) {
-                                    // Try alternative field name
-                                    Serial.println("[DEBUG] englishNarrator not found, trying narrator field");
-                                    narratorStartPos = payload.indexOf("\"narrator\":");
-                                }
-                                
-                                if (narratorStartPos > 0) {
-                                    Serial.println("[DEBUG] Found narrator field at position " + String(narratorStartPos));
-                                    
-                                    // Determine field name length (either 18 for englishNarrator or 10 for narrator)
-                                    int fieldLength = (payload.substring(narratorStartPos, narratorStartPos+10) == "\"narrator\"") ? 10 : 18;
-                                    narratorStartPos += fieldLength; // Skip field name and colon
-                                    
-                                    int narratorEndPos = payload.indexOf('"', narratorStartPos);
-                                    Serial.println("[DEBUG] Narrator end position: " + String(narratorEndPos));
-                                    
-                                    if (narratorEndPos > narratorStartPos) {
-                                        englishNarrator = payload.substring(narratorStartPos, narratorEndPos);
-                                        englishNarrator.replace("\\", ""); // Remove backslashes
-                                        Serial.println("[DEBUG] Extracted narrator: '" + englishNarrator + "'");
-                                    } else {
-                                        englishNarrator = ""; // Empty if not found
-                                        Serial.println("[DEBUG] Could not find end of narrator field");
-                                    }
-                                } else {
-                                    // Use the book name as fallback narrator
-                                    englishNarrator = "Narrated in " + book;
-                                    Serial.println("[DEBUG] No narrator field found, using book name: '" + englishNarrator + "'");
-                                }
-                                
-                                // Successfully extracted hadith and source
-                                Serial.println("[DEBUG] Successfully extracted hadith #" + String(hadithNumber));
-                                http.end();
-                                return true;
+                        // Basic text processing: remove \" and \n, \r. More robust processing might be needed.
+                        hadithText.replace("\\\"", "\""); // Replace escaped quotes with actual quotes
+                        hadithText.replace("\\n", "\n");   // Replace escaped newlines
+                        hadithText.replace("\\r", "");    // Remove escaped carriage returns
+                        // Add other specific replacements if needed, e.g., for ufdfa (ﷺ)
+                        hadithText.replace("ufdfa", "(PBUH)"); // Example from memory
+
+                        // Filter out non-ASCII characters to remove Arabic and other symbols
+                        String filteredHadithText = "";
+                        for (int k = 0; k < hadithText.length(); k++) {
+                            char c = hadithText.charAt(k);
+                            if (c >= ' ' && c <= '~') { // Keep only printable ASCII
+                                filteredHadithText += c;
                             }
                         }
-                    }
-                }
-            }
-            
-            Serial.println("[DEBUG] Failed to extract hadith #" + String(hadithNumber) + ", trying another...");
-        } else {
-            Serial.println("[DEBUG] HTTP request failed for hadith #" + String(hadithNumber));
-        }
-        
-        http.end();
-    }
-    
-    Serial.println("[DEBUG] Failed to fetch a valid hadith after 5 attempts");
-    return false;
-}
+                        hadithText = filteredHadithText; // Replace original with filtered
 
-// Improved text wrapping function with consistent spacing and proper word wrapping
-// Returns the y-position after the last line of text
-// Function to draw a QR code on the e-paper display
-void drawQRCode(String url, int x, int y, int size, UBYTE* image) {
-    // Skip QR code generation if URL is empty or too short
-    if (url.length() < 5) {
-        Serial.println("[DEBUG] Skipping QR code - URL too short");
-        return;
-    }
-    
-    Serial.print("[DEBUG] QR Code URL: ");
-    Serial.println(url);
-    
-    // Create the QR code
-    QRCode qrcode;
-    
-    // Use version 3 for better compatibility (same as working example)
-    const int qrVersion = 3;
-    
-    // Calculate the size of the QR code data buffer
-    uint8_t qrcodeData[qrcode_getBufferSize(qrVersion)];
-    
-    // Initialize the QR code with MEDIUM error correction for better reliability
-    qrcode_initText(&qrcode, qrcodeData, qrVersion, ECC_MEDIUM, url.c_str());
-    
-    // Smaller module size for more compact QR code
-    const int moduleSize = 4;
-    
-    // Calculate QR code size in pixels
-    const int qrPixelSize = qrcode.size * moduleSize;
-    
-    Serial.printf("[DEBUG] QR Code size: %d modules, %d pixels\n", qrcode.size, qrPixelSize);
-    
-    // Select the image buffer
-    Paint_SelectImage(image);
-    
-    // Create a white background with adequate quiet zone
-    const int quietZone = 20; // Standard quiet zone (about 4 modules)
-    Paint_DrawRectangle(x - quietZone, y - quietZone, 
-                        x + qrPixelSize + quietZone, 
-                        y + qrPixelSize + quietZone, 
-                        WHITE, DOT_PIXEL_1X1, DRAW_FILL_FULL);
-    
-    // Draw the QR code modules - simple approach that works reliably
-    for (uint8_t qrY = 0; qrY < qrcode.size; qrY++) {
-        for (uint8_t qrX = 0; qrX < qrcode.size; qrX++) {
-            if (qrcode_getModule(&qrcode, qrX, qrY)) {
-                // Draw a filled square for each black module
-                Paint_DrawRectangle(
-                    x + qrX * moduleSize,
-                    y + qrY * moduleSize,
-                    x + (qrX + 1) * moduleSize - 1,
-                    y + (qrY + 1) * moduleSize - 1,
-                    BLACK,
-                    DOT_PIXEL_1X1,
-                    DRAW_FILL_FULL
-                );
+                        int currentLength = hadithText.length();
+                        Serial.println("[DEBUG] Trying entry " + String(indices[i]) + " from payload, processed length: " + String(currentLength));
+
+                        if (currentLength >= MIN_HADITH_LENGTH && currentLength <= MAX_HADITH_LENGTH) {
+                            Serial.println("[DEBUG] Suitable hadith found in payload!");
+                            
+                            // Narrator
+                            if (!hadithObject["englishNarrator"].isNull()) {
+                                englishNarrator = String(hadithObject["englishNarrator"].as<const char*>());
+                            } else {
+                                englishNarrator = ""; // Default to empty if null or missing
+                            }
+                            
+                            // Source (Book Name - Chapter English)
+                            String bookName = "Unknown Book";
+                            if (hadithObject["book"].is<JsonObject>() && !hadithObject["book"]["bookName"].isNull()) {
+                                bookName = String(hadithObject["book"]["bookName"].as<const char*>());
+                            }
+                            String chapterEnglish = "Unknown Chapter";
+                            if (hadithObject["chapter"].is<JsonObject>() && !hadithObject["chapter"]["chapterEnglish"].isNull()) {
+                                chapterEnglish = String(hadithObject["chapter"]["chapterEnglish"].as<const char*>());
+                            }
+                            hadithSource = bookName + " - " + chapterEnglish;
+
+                            Serial.println("[DEBUG] Final Hadith Text Preview: '" + hadithText.substring(0, min(100, (int)hadithText.length())) + "...'");
+                            Serial.println("[DEBUG] Final Narrator: " + englishNarrator);
+                            Serial.println("[DEBUG] Final Source: " + hadithSource);
+                            
+                            http.end();
+                            return true; // Suitable hadith found and processed
+                        } else {
+                            Serial.println("[DEBUG] Hadith length (" + String(currentLength) + ") not suitable. Min: " + String(MIN_HADITH_LENGTH) + ", Max: " + String(MAX_HADITH_LENGTH));
+                        }
+                    }
+                    Serial.println("[DEBUG] No suitable hadith found in the current payload's entries after checking all.");
+                } else {
+                    Serial.println("[DEBUG] No hadith entries found in 'data' array of the payload.");
+                }
+            } else {
+                Serial.printf("[DEBUG] HTTP GET... failed, server error code: %d, message: %s\n", httpCode, http.errorToString(httpCode).c_str());
             }
+        } else {
+            Serial.printf("[DEBUG] HTTP GET... failed, client/connection error: %s\n", http.errorToString(httpCode).c_str());
         }
+        http.end();
+        delay(500); // Wait a bit before retrying API call
     }
-    
-    // Print QR code to serial for debugging
-    Serial.println("[DEBUG] QR Code pattern:");
-    for (uint8_t y = 0; y < qrcode.size; y++) {
-        for (uint8_t x = 0; x < qrcode.size; x++) {
-            Serial.print(qrcode_getModule(&qrcode, x, y) ? "██" : "  ");
-        }
-        Serial.println();
-    }
+    Serial.println("[ERROR] Failed to fetch a suitable hadith after all " + String(10) + " attempts.");
+    return false;
 }
 
 int drawWrappedText(const char* text, int x, int y, sFONT* font, UWORD background, UWORD foreground) {
